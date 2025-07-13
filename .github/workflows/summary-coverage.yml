@@ -1,0 +1,118 @@
+name: Full Jest Coverage
+ 
+on:
+  push:
+    branches:
+      - main
+ 
+jobs:
+  coverage-report:
+    runs-on: ubuntu-latest
+ 
+    permissions:
+      contents: read
+ 
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v3
+ 
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+ 
+      - name: Install dependencies
+        run: |
+          echo "📦 Installing dependencies..."
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+ 
+      - name: Run Jest, Parse Results, and POST to ServiceNow
+        run: |
+          echo "🧪 Running Jest with coverage..."
+          OUTPUT=$(npx jest --coverage 2>&1 | tee /dev/stderr)
+ 
+          echo "📊 Extracting summary..."
+          TESTS=$(echo "$OUTPUT" | grep "^Tests:" | sed 's/^Tests:[[:space:]]*//')
+          TIME=$(echo "$OUTPUT" | grep "^Time:" | sed 's/^Time:[[:space:]]*//')
+ 
+          echo "🧪 Extracting test results..."
+          TEST_RESULTS_JSON="["
+          IS_FIRST=1
+          CURRENT_FILE=""
+          CURRENT_ERROR=""
+          IN_FAILURE=0
+ 
+          while IFS= read -r line; do
+            if [[ "$line" =~ ^PASS ]]; then
+              FILE=$(echo "$line" | awk '{print $2}')
+              ENTRY=$(jq -n --arg file "$FILE" --arg status "PASS" '{file: $file, status: $status}')
+              if [[ $IS_FIRST -eq 1 ]]; then
+                IS_FIRST=0
+              else
+                TEST_RESULTS_JSON="${TEST_RESULTS_JSON},"
+              fi
+              TEST_RESULTS_JSON="${TEST_RESULTS_JSON}${ENTRY}"
+            elif [[ "$line" =~ ^FAIL ]]; then
+              FILE=$(echo "$line" | awk '{print $2}')
+              CURRENT_FILE="$FILE"
+              CURRENT_ERROR=""
+              IN_FAILURE=1
+            elif [[ $IN_FAILURE -eq 1 ]]; then
+              if [[ "$line" == "" || "$line" =~ ^PASS || "$line" =~ ^FAIL ]]; then
+                ENTRY=$(jq -n --arg file "$CURRENT_FILE" --arg status "FAIL" --arg error "$CURRENT_ERROR" '{file: $file, status: $status, error: $error}')
+                if [[ $IS_FIRST -eq 1 ]]; then
+                  IS_FIRST=0
+                else
+                  TEST_RESULTS_JSON="${TEST_RESULTS_JSON},"
+                fi
+                TEST_RESULTS_JSON="${TEST_RESULTS_JSON}${ENTRY}"
+                IN_FAILURE=0
+              else
+                CURRENT_ERROR="${CURRENT_ERROR}\n${line}"
+              fi
+            fi
+          done <<< "$OUTPUT"
+ 
+          if [[ $IN_FAILURE -eq 1 ]]; then
+            ENTRY=$(jq -n --arg file "$CURRENT_FILE" --arg status "FAIL" --arg error "$CURRENT_ERROR" '{file: $file, status: $status, error: $error}')
+            if [[ $IS_FIRST -eq 1 ]]; then
+              IS_FIRST=0
+            else
+              TEST_RESULTS_JSON="${TEST_RESULTS_JSON},"
+            fi
+            TEST_RESULTS_JSON="${TEST_RESULTS_JSON}${ENTRY}"
+          fi
+ 
+          TEST_RESULTS_JSON="${TEST_RESULTS_JSON}]"
+ 
+          echo "🛠️ Building JSON payload..."
+          FINAL_JSON=$(jq -n \
+            --arg repo_name "sairamcse001/now-unit-guardians" \
+            --arg tests "$TESTS" \
+            --arg time "$TIME" \
+            --argjson test_results "$TEST_RESULTS_JSON" \
+            '{
+              repo_name: $repo_name,
+              test_summary: {
+                tests: $tests,
+                time: $time
+              },
+              test_results: $test_results
+            }')
+ 
+          echo "$FINAL_JSON" > payload.json
+          cat payload.json
+ 
+          echo "📡 Sending to ServiceNow API..."
+          RESPONSE=$(curl --silent --write-out "HTTPSTATUS:%{http_code}" --output response.txt --location 'https://hackai.service-now.com/api/snc/candy_content/test_summary' \
+            --header 'Content-Type: application/json' \
+            --data @payload.json)
+ 
+          HTTP_STATUS=$(echo "$RESPONSE" | tr -d '\n' | sed -e 's/.*HTTPSTATUS://')
+          echo "✅ HTTP Status: $HTTP_STATUS"
+          echo "📨 API Response:"
+          cat response.txt
